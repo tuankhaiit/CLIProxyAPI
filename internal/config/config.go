@@ -173,6 +173,15 @@ type AmpCode struct {
 	// ForceModelMappings when true, model mappings take precedence over local API keys.
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
+
+	// EnabledFallback toggles the fallback mechanism to ampcode.com.
+	// When true (default), requests without a local provider are forwarded to ampcode.com.
+	// When false, such requests return an error.
+	EnabledFallback bool `yaml:"enabled-fallback" json:"enabled-fallback"`
+
+	// DefaultFallbackModel defines a default model to use when no local provider is found.
+	// If set, the request is treated as if this model was mapped.
+	DefaultFallbackModel string `yaml:"default-fallback-model" json:"default-fallback-model"`
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
@@ -364,6 +373,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
+	cfg.AmpCode.EnabledFallback = true                // Default to true: fallback to ampcode.com enabled by default
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {

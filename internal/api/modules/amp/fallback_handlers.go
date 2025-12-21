@@ -77,29 +77,41 @@ func logAmpRouting(routeType AmpRouteType, requestedModel, resolvedModel, provid
 // FallbackHandler wraps a standard handler with fallback logic to ampcode.com
 // when the model's provider is not available in CLIProxyAPI
 type FallbackHandler struct {
-	getProxy           func() *httputil.ReverseProxy
-	modelMapper        ModelMapper
-	forceModelMappings func() bool
+	getProxy             func() *httputil.ReverseProxy
+	modelMapper          ModelMapper
+	forceModelMappings   func() bool
+	enabledFallback      func() bool
+	defaultFallbackModel func() string
 }
 
 // NewFallbackHandler creates a new fallback handler wrapper
 // The getProxy function allows lazy evaluation of the proxy (useful when proxy is created after routes)
 func NewFallbackHandler(getProxy func() *httputil.ReverseProxy) *FallbackHandler {
 	return &FallbackHandler{
-		getProxy:           getProxy,
-		forceModelMappings: func() bool { return false },
+		getProxy:             getProxy,
+		forceModelMappings:   func() bool { return false },
+		enabledFallback:      func() bool { return true },
+		defaultFallbackModel: func() string { return "" },
 	}
 }
 
 // NewFallbackHandlerWithMapper creates a new fallback handler with model mapping support
-func NewFallbackHandlerWithMapper(getProxy func() *httputil.ReverseProxy, mapper ModelMapper, forceModelMappings func() bool) *FallbackHandler {
+func NewFallbackHandlerWithMapper(getProxy func() *httputil.ReverseProxy, mapper ModelMapper, forceModelMappings func() bool, enabledFallback func() bool, defaultFallbackModel func() string) *FallbackHandler {
 	if forceModelMappings == nil {
 		forceModelMappings = func() bool { return false }
 	}
+	if enabledFallback == nil {
+		enabledFallback = func() bool { return true }
+	}
+	if defaultFallbackModel == nil {
+		defaultFallbackModel = func() string { return "" }
+	}
 	return &FallbackHandler{
-		getProxy:           getProxy,
-		modelMapper:        mapper,
-		forceModelMappings: forceModelMappings,
+		getProxy:             getProxy,
+		modelMapper:          mapper,
+		forceModelMappings:   forceModelMappings,
+		enabledFallback:      enabledFallback,
+		defaultFallbackModel: defaultFallbackModel,
 	}
 }
 
@@ -219,21 +231,60 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 
 		// If no providers available, fallback to ampcode.com
 		if len(providers) == 0 {
-			proxy := fh.getProxy()
-			if proxy != nil {
-				// Log: Forwarding to ampcode.com (uses Amp credits)
-				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
+			shouldProxy := true
 
-				// Restore body again for the proxy
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			// Check enabledFallback (key "enabled-fallback")
+			if fh.enabledFallback != nil && !fh.enabledFallback() {
+				shouldProxy = false
+				log.Debugf("amp fallback disabled, returning error for: %s", modelName)
+			} else {
+				// Check defaultFallbackModel (key "default-fallback-model")
+				if fh.defaultFallbackModel != nil {
+					if defaultModel := fh.defaultFallbackModel(); defaultModel != "" {
+						// Handle like a mapped model found
+						log.Infof("amp using default fallback model: %s -> %s", modelName, defaultModel)
 
-				// Forward to ampcode.com
-				proxy.ServeHTTP(c.Writer, c.Request)
-				return
+						mappedBaseModel, _ := util.NormalizeThinkingModel(defaultModel)
+						mappedProviders := util.GetProviderName(mappedBaseModel)
+
+						if len(mappedProviders) > 0 {
+							// Rewrite model in request
+							bodyBytes = rewriteModelInRequest(bodyBytes, defaultModel)
+							c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+							c.Set(MappedModelContextKey, defaultModel)
+
+							resolvedModel = defaultModel
+							usedMapping = true
+							providers = mappedProviders
+							shouldProxy = false // Handled locally
+						} else {
+							// Default model configured but not available locally
+							log.Warnf("amp default fallback model configured but not available: %s", defaultModel)
+							shouldProxy = false // Don't proxy if explicit fallback configured but missing?
+							// User instruction: "if defaultFallbackModel has value, then handle this request like has a mapped model found"
+							// If a mapped model is found but has no providers, it falls through to error.
+						}
+					}
+				}
 			}
 
-			// No proxy available, let the normal handler return the error
-			logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
+			if shouldProxy {
+				proxy := fh.getProxy()
+				if proxy != nil {
+					// Log: Forwarding to ampcode.com (uses Amp credits)
+					logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
+
+					// Restore body again for the proxy
+					c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+					// Forward to ampcode.com
+					proxy.ServeHTTP(c.Writer, c.Request)
+					return
+				}
+
+				// No proxy available, let the normal handler return the error
+				logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
+			}
 		}
 
 		// Log the routing decision

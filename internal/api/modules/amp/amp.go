@@ -110,6 +110,26 @@ func (m *AmpModule) forceModelMappings() bool {
 	return m.lastConfig.ForceModelMappings
 }
 
+// enabledFallback returns whether fallback to ampcode.com is enabled
+func (m *AmpModule) enabledFallback() bool {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	if m.lastConfig == nil {
+		return true // Default to true if no config yet
+	}
+	return m.lastConfig.EnabledFallback
+}
+
+// defaultFallbackModel returns the default fallback model if configured
+func (m *AmpModule) defaultFallbackModel() string {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	if m.lastConfig == nil {
+		return ""
+	}
+	return m.lastConfig.DefaultFallbackModel
+}
+
 // Register sets up Amp routes if configured.
 // This implements the RouteModuleV2 interface with Context.
 // Routes are registered only once via sync.Once for idempotent behavior.

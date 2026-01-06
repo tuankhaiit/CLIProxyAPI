@@ -71,10 +71,13 @@ func ApplyGeminiThinkingConfig(body []byte, budget *int, includeThoughts *bool) 
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "generationConfig.thinkingConfig.include_thoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "generationConfig.thinkingConfig.include_thoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
 	}
 	return updated
@@ -99,10 +102,13 @@ func ApplyGeminiCLIThinkingConfig(body []byte, budget *int, includeThoughts *boo
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "request.generationConfig.thinkingConfig.include_thoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "request.generationConfig.thinkingConfig.include_thoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
 	}
 	return updated
@@ -130,14 +136,14 @@ func ApplyGeminiThinkingLevel(body []byte, level string, includeThoughts *bool) 
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "generationConfig.thinkingConfig.includeThoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "generationConfig.thinkingConfig.includeThoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
-	}
-	if it := gjson.GetBytes(body, "generationConfig.thinkingConfig.include_thoughts"); it.Exists() {
-		updated, _ = sjson.DeleteBytes(updated, "generationConfig.thinkingConfig.include_thoughts")
 	}
 	if tb := gjson.GetBytes(body, "generationConfig.thinkingConfig.thinkingBudget"); tb.Exists() {
 		updated, _ = sjson.DeleteBytes(updated, "generationConfig.thinkingConfig.thinkingBudget")
@@ -167,14 +173,14 @@ func ApplyGeminiCLIThinkingLevel(body []byte, level string, includeThoughts *boo
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "request.generationConfig.thinkingConfig.includeThoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "request.generationConfig.thinkingConfig.includeThoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
-	}
-	if it := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.include_thoughts"); it.Exists() {
-		updated, _ = sjson.DeleteBytes(updated, "request.generationConfig.thinkingConfig.include_thoughts")
 	}
 	if tb := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.thinkingBudget"); tb.Exists() {
 		updated, _ = sjson.DeleteBytes(updated, "request.generationConfig.thinkingConfig.thinkingBudget")
@@ -251,9 +257,14 @@ func ThinkingBudgetToGemini3Level(model string, budget int) (string, bool) {
 
 // modelsWithDefaultThinking lists models that should have thinking enabled by default
 // when no explicit thinkingConfig is provided.
+// Note: Gemini 3 models are NOT included here because per Google's official documentation:
+//   - thinkingLevel defaults to "high" (dynamic thinking)
+//   - includeThoughts defaults to false
+//
+// We should not override these API defaults; let users explicitly configure if needed.
 var modelsWithDefaultThinking = map[string]bool{
-	"gemini-3-pro-preview":       true,
-	"gemini-3-pro-image-preview": true,
+	// "gemini-3-pro-preview":       true,
+	// "gemini-3-pro-image-preview": true,
 	// "gemini-3-flash-preview":     true,
 }
 
@@ -288,37 +299,73 @@ func ApplyDefaultThinkingIfNeeded(model string, body []byte) []byte {
 
 // ApplyGemini3ThinkingLevelFromMetadata applies thinkingLevel from metadata for Gemini 3 models.
 // For standard Gemini API format (generationConfig.thinkingConfig path).
-// This handles the case where reasoning_effort is specified via model name suffix (e.g., model(minimal)).
+// This handles the case where reasoning_effort is specified via model name suffix (e.g., model(minimal))
+// or numeric budget suffix (e.g., model(1000)) which gets converted to a thinkingLevel.
 func ApplyGemini3ThinkingLevelFromMetadata(model string, metadata map[string]any, body []byte) []byte {
-	if !IsGemini3Model(model) {
+	// Use the alias from metadata if available for model type detection
+	lookupModel := ResolveOriginalModel(model, metadata)
+	if !IsGemini3Model(lookupModel) && !IsGemini3Model(model) {
 		return body
 	}
+
+	// Determine which model to use for validation
+	checkModel := model
+	if IsGemini3Model(lookupModel) {
+		checkModel = lookupModel
+	}
+
+	// First try to get effort string from metadata
 	effort, ok := ReasoningEffortFromMetadata(metadata)
-	if !ok || effort == "" {
-		return body
+	if ok && effort != "" {
+		if level, valid := ValidateGemini3ThinkingLevel(checkModel, effort); valid {
+			return ApplyGeminiThinkingLevel(body, level, nil)
+		}
 	}
-	// Validate and apply the thinkingLevel
-	if level, valid := ValidateGemini3ThinkingLevel(model, effort); valid {
-		return ApplyGeminiThinkingLevel(body, level, nil)
+
+	// Fallback: check for numeric budget and convert to thinkingLevel
+	budget, _, _, matched := ThinkingFromMetadata(metadata)
+	if matched && budget != nil {
+		if level, valid := ThinkingBudgetToGemini3Level(checkModel, *budget); valid {
+			return ApplyGeminiThinkingLevel(body, level, nil)
+		}
 	}
+
 	return body
 }
 
 // ApplyGemini3ThinkingLevelFromMetadataCLI applies thinkingLevel from metadata for Gemini 3 models.
 // For Gemini CLI API format (request.generationConfig.thinkingConfig path).
-// This handles the case where reasoning_effort is specified via model name suffix (e.g., model(minimal)).
+// This handles the case where reasoning_effort is specified via model name suffix (e.g., model(minimal))
+// or numeric budget suffix (e.g., model(1000)) which gets converted to a thinkingLevel.
 func ApplyGemini3ThinkingLevelFromMetadataCLI(model string, metadata map[string]any, body []byte) []byte {
-	if !IsGemini3Model(model) {
+	// Use the alias from metadata if available for model type detection
+	lookupModel := ResolveOriginalModel(model, metadata)
+	if !IsGemini3Model(lookupModel) && !IsGemini3Model(model) {
 		return body
 	}
+
+	// Determine which model to use for validation
+	checkModel := model
+	if IsGemini3Model(lookupModel) {
+		checkModel = lookupModel
+	}
+
+	// First try to get effort string from metadata
 	effort, ok := ReasoningEffortFromMetadata(metadata)
-	if !ok || effort == "" {
-		return body
+	if ok && effort != "" {
+		if level, valid := ValidateGemini3ThinkingLevel(checkModel, effort); valid {
+			return ApplyGeminiCLIThinkingLevel(body, level, nil)
+		}
 	}
-	// Validate and apply the thinkingLevel
-	if level, valid := ValidateGemini3ThinkingLevel(model, effort); valid {
-		return ApplyGeminiCLIThinkingLevel(body, level, nil)
+
+	// Fallback: check for numeric budget and convert to thinkingLevel
+	budget, _, _, matched := ThinkingFromMetadata(metadata)
+	if matched && budget != nil {
+		if level, valid := ThinkingBudgetToGemini3Level(checkModel, *budget); valid {
+			return ApplyGeminiCLIThinkingLevel(body, level, nil)
+		}
 	}
+
 	return body
 }
 
@@ -326,15 +373,17 @@ func ApplyGemini3ThinkingLevelFromMetadataCLI(model string, metadata map[string]
 // For Gemini CLI API format (request.generationConfig.thinkingConfig path).
 // Returns the modified body if thinkingConfig was added, otherwise returns the original.
 // For Gemini 3 models, uses thinkingLevel instead of thinkingBudget per Google's documentation.
-func ApplyDefaultThinkingIfNeededCLI(model string, body []byte) []byte {
-	if !ModelHasDefaultThinking(model) {
+func ApplyDefaultThinkingIfNeededCLI(model string, metadata map[string]any, body []byte) []byte {
+	// Use the alias from metadata if available for model property lookup
+	lookupModel := ResolveOriginalModel(model, metadata)
+	if !ModelHasDefaultThinking(lookupModel) && !ModelHasDefaultThinking(model) {
 		return body
 	}
 	if gjson.GetBytes(body, "request.generationConfig.thinkingConfig").Exists() {
 		return body
 	}
 	// Gemini 3 models use thinkingLevel instead of thinkingBudget
-	if IsGemini3Model(model) {
+	if IsGemini3Model(lookupModel) || IsGemini3Model(model) {
 		// Don't set a default - let the API use its dynamic default ("high")
 		// Only set includeThoughts
 		updated, _ := sjson.SetBytes(body, "request.generationConfig.thinkingConfig.includeThoughts", true)

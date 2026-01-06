@@ -111,6 +111,9 @@ type Manager struct {
 	requestRetry     atomic.Int32
 	maxRetryInterval atomic.Int64
 
+	// modelNameMappings stores global model name alias mappings (alias -> upstream name) keyed by channel.
+	modelNameMappings atomic.Value
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -203,10 +206,10 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
-	auth.EnsureIndex()
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	auth.EnsureIndex()
 	m.mu.Lock()
 	m.auths[auth.ID] = auth.Clone()
 	m.mu.Unlock()
@@ -221,7 +224,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, nil
 	}
 	m.mu.Lock()
-	if existing, ok := m.auths[auth.ID]; ok && existing != nil && !auth.indexAssigned && auth.Index == 0 {
+	if existing, ok := m.auths[auth.ID]; ok && existing != nil && !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
 	}
@@ -263,7 +266,6 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	rotated := m.rotateProviders(req.Model, normalized)
-	defer m.advanceProviderCursor(req.Model, normalized)
 
 	retryTimes, maxWait := m.retrySettings()
 	attempts := retryTimes + 1
@@ -302,7 +304,6 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	rotated := m.rotateProviders(req.Model, normalized)
-	defer m.advanceProviderCursor(req.Model, normalized)
 
 	retryTimes, maxWait := m.retrySettings()
 	attempts := retryTimes + 1
@@ -341,7 +342,6 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	rotated := m.rotateProviders(req.Model, normalized)
-	defer m.advanceProviderCursor(req.Model, normalized)
 
 	retryTimes, maxWait := m.retrySettings()
 	attempts := retryTimes + 1
@@ -413,6 +413,7 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 		}
 		execReq := req
 		execReq.Model, execReq.Metadata = rewriteModelForAuth(routeModel, req.Metadata, auth)
+		execReq.Model, execReq.Metadata = m.applyOAuthModelMapping(auth, execReq.Model, execReq.Metadata)
 		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
@@ -474,6 +475,7 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 		}
 		execReq := req
 		execReq.Model, execReq.Metadata = rewriteModelForAuth(routeModel, req.Metadata, auth)
+		execReq.Model, execReq.Metadata = m.applyOAuthModelMapping(auth, execReq.Model, execReq.Metadata)
 		resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
@@ -535,6 +537,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 		}
 		execReq := req
 		execReq.Model, execReq.Metadata = rewriteModelForAuth(routeModel, req.Metadata, auth)
+		execReq.Model, execReq.Metadata = m.applyOAuthModelMapping(auth, execReq.Model, execReq.Metadata)
 		chunks, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
 			rerr := &Error{Message: errStream.Error()}
@@ -595,6 +598,7 @@ func stripPrefixFromMetadata(metadata map[string]any, needle string) map[string]
 	keys := []string{
 		util.ThinkingOriginalModelMetadataKey,
 		util.GeminiOriginalModelMetadataKey,
+		util.ModelMappingOriginalModelMetadataKey,
 	}
 	var out map[string]any
 	for _, key := range keys {
@@ -640,13 +644,20 @@ func (m *Manager) normalizeProviders(providers []string) []string {
 	return result
 }
 
+// rotateProviders returns a rotated view of the providers list starting from the
+// current offset for the model, and atomically increments the offset for the next call.
+// This ensures concurrent requests get different starting providers.
 func (m *Manager) rotateProviders(model string, providers []string) []string {
 	if len(providers) == 0 {
 		return nil
 	}
-	m.mu.RLock()
+
+	// Atomic read-and-increment: get current offset and advance cursor in one lock
+	m.mu.Lock()
 	offset := m.providerOffsets[model]
-	m.mu.RUnlock()
+	m.providerOffsets[model] = (offset + 1) % len(providers)
+	m.mu.Unlock()
+
 	if len(providers) > 0 {
 		offset %= len(providers)
 	}
@@ -660,19 +671,6 @@ func (m *Manager) rotateProviders(model string, providers []string) []string {
 	rotated = append(rotated, providers[offset:]...)
 	rotated = append(rotated, providers[:offset]...)
 	return rotated
-}
-
-func (m *Manager) advanceProviderCursor(model string, providers []string) {
-	if len(providers) == 0 {
-		m.mu.Lock()
-		delete(m.providerOffsets, model)
-		m.mu.Unlock()
-		return
-	}
-	m.mu.Lock()
-	current := m.providerOffsets[model]
-	m.providerOffsets[model] = (current + 1) % len(providers)
-	m.mu.Unlock()
 }
 
 func (m *Manager) retrySettings() (int, time.Duration) {
@@ -1538,6 +1536,9 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 }
 
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor
@@ -1550,6 +1551,10 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	}
 	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
+	if err != nil && errors.Is(err, context.Canceled) {
+		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
+		return
+	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {

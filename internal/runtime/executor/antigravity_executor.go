@@ -1493,3 +1493,117 @@ func antigravityMinThinkingBudget(model string) int {
 	}
 	return -1
 }
+
+// AntigravityQuotaInfo represents the quota information for a model.
+type AntigravityQuotaInfo struct {
+	RemainingFraction float64 `json:"remaining_fraction"`
+	ResetTime         string  `json:"reset_time"`
+}
+
+// AntigravityModelWithQuota represents a model with its quota information.
+type AntigravityModelWithQuota struct {
+	ID    string               `json:"id"`
+	Quota AntigravityQuotaInfo `json:"quota"`
+}
+
+// FetchAntigravityModelsWithQuota retrieves available models and their quota information.
+func FetchAntigravityModelsWithQuota(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config, projectID string) ([]AntigravityModelWithQuota, error) {
+	exec := &AntigravityExecutor{cfg: cfg}
+	token, updatedAuth, errToken := exec.ensureAccessToken(ctx, auth)
+	if errToken != nil {
+		return nil, errToken
+	}
+	if updatedAuth != nil {
+		auth = updatedAuth
+	}
+
+	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0)
+
+	var lastErr error
+
+	for idx, baseURL := range baseURLs {
+		modelsURL := baseURL + antigravityModelsPath
+		
+		bodyJSON := "{}"
+		if projectID != "" {
+			bodyJSON = fmt.Sprintf(`{"project": "%s"}`, projectID)
+		}
+
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, modelsURL, bytes.NewReader([]byte(bodyJSON)))
+		if errReq != nil {
+			return nil, errReq
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+		if host := resolveHost(baseURL); host != "" {
+			httpReq.Host = host
+		}
+
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
+				return nil, errDo
+			}
+			lastErr = errDo
+			if idx+1 < len(baseURLs) {
+				log.Debugf("antigravity executor: models quota request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
+				continue
+			}
+			continue
+		}
+
+		bodyBytes, errRead := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("antigravity executor: close response body error: %v", errClose)
+		}
+		if errRead != nil {
+			lastErr = errRead
+			if idx+1 < len(baseURLs) {
+				log.Debugf("antigravity executor: models quota read error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
+				continue
+			}
+			continue
+		}
+		if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+			lastErr = fmt.Errorf("status %d: %s", httpResp.StatusCode, string(bodyBytes))
+			if httpResp.StatusCode == http.StatusTooManyRequests && idx+1 < len(baseURLs) {
+				log.Debugf("antigravity executor: models quota request rate limited on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
+				continue
+			}
+			continue
+		}
+
+		result := gjson.GetBytes(bodyBytes, "models")
+		if !result.Exists() {
+			return []AntigravityModelWithQuota{}, nil
+		}
+
+		models := make([]AntigravityModelWithQuota, 0, len(result.Map()))
+		for originalName, modelData := range result.Map() {
+			aliasName := modelName2Alias(originalName)
+			if aliasName != "" {
+				quotaInfo := AntigravityQuotaInfo{}
+				
+				// Parse quota info if available
+				quotaNode := modelData.Get("quotaInfo")
+				if quotaNode.Exists() {
+					quotaInfo.RemainingFraction = quotaNode.Get("remainingFraction").Float()
+					quotaInfo.ResetTime = quotaNode.Get("resetTime").String()
+				}
+
+				models = append(models, AntigravityModelWithQuota{
+					ID:    aliasName,
+					Quota: quotaInfo,
+				})
+			}
+		}
+		return models, nil
+	}
+	
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no base url available")
+}

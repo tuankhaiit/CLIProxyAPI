@@ -246,7 +246,7 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 						// Handle like a mapped model found
 						log.Infof("amp using default fallback model: %s -> %s", modelName, defaultModel)
 
-						mappedBaseModel, _ := util.NormalizeThinkingModel(defaultModel)
+						mappedBaseModel := thinking.ParseSuffix(defaultModel).ModelName
 						mappedProviders := util.GetProviderName(mappedBaseModel)
 
 						if len(mappedProviders) > 0 {

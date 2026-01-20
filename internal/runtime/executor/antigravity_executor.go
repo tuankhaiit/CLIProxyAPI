@@ -1512,16 +1512,38 @@ func alias2ModelName(modelName string) string {
 // normalizeAntigravityThinking clamps or removes thinking config based on model support.
 // For Claude models, it additionally ensures thinking budget < max_tokens.
 func normalizeAntigravityThinking(model string, payload []byte, isClaude bool) []byte {
-	payload = util.StripThinkingConfigIfUnsupported(model, payload)
-	if !util.ModelSupportsThinking(model) {
+	modelInfo := registry.GetGlobalRegistry().GetModelInfo(model, antigravityAuthType)
+	supportsThinking := modelInfo != nil && modelInfo.Thinking != nil
+
+	if !supportsThinking {
+		return thinking.StripThinkingConfig(payload, "antigravity")
+	}
+
+	budgetResult := gjson.GetBytes(payload, "request.generationConfig.thinkingConfig.thinkingBudget")
+	if !budgetResult.Exists() {
 		return payload
 	}
-	budget := gjson.GetBytes(payload, "request.generationConfig.thinkingConfig.thinkingBudget")
-	if !budget.Exists() {
-		return payload
+	raw := int(budgetResult.Int())
+
+	normalized := raw
+	if modelInfo != nil && modelInfo.Thinking != nil {
+		min, max := modelInfo.Thinking.Min, modelInfo.Thinking.Max
+		if normalized == 0 && !modelInfo.Thinking.ZeroAllowed {
+			normalized = min
+		} else if normalized == -1 {
+			// Keep -1 (auto)
+		} else if min == 0 && max == 0 {
+			// No limits defined
+		} else if normalized < min {
+			if normalized == 0 && modelInfo.Thinking.ZeroAllowed {
+				normalized = 0
+			} else {
+				normalized = min
+			}
+		} else if normalized > max {
+			normalized = max
+		}
 	}
-	raw := int(budget.Int())
-	normalized := util.NormalizeThinkingBudget(model, raw)
 
 	if isClaude {
 		effectiveMax, setDefaultMax := antigravityEffectiveMaxTokens(model, payload)
@@ -1555,7 +1577,7 @@ func antigravityEffectiveMaxTokens(model string, payload []byte) (max int, fromM
 	if maxTok := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxTok.Exists() && maxTok.Int() > 0 {
 		return int(maxTok.Int()), false
 	}
-	if modelInfo := registry.GetGlobalRegistry().GetModelInfo(model); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
+	if modelInfo := registry.GetGlobalRegistry().GetModelInfo(model, antigravityAuthType); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
 		return modelInfo.MaxCompletionTokens, true
 	}
 	return 0, false
@@ -1564,7 +1586,7 @@ func antigravityEffectiveMaxTokens(model string, payload []byte) (max int, fromM
 // antigravityMinThinkingBudget returns the minimum thinking budget for a model.
 // Falls back to -1 if no model info is found.
 func antigravityMinThinkingBudget(model string) int {
-	if modelInfo := registry.GetGlobalRegistry().GetModelInfo(model); modelInfo != nil && modelInfo.Thinking != nil {
+	if modelInfo := registry.GetGlobalRegistry().GetModelInfo(model, antigravityAuthType); modelInfo != nil && modelInfo.Thinking != nil {
 		return modelInfo.Thinking.Min
 	}
 	return -1

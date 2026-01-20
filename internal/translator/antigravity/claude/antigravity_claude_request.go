@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
@@ -21,6 +22,14 @@ import (
 // deriveSessionID generates a stable session ID from the request.
 // Uses the hash of the first user message to identify the conversation.
 func deriveSessionID(rawJSON []byte) string {
+	userIDResult := gjson.GetBytes(rawJSON, "metadata.user_id")
+	if userIDResult.Exists() {
+		userID := userIDResult.String()
+		idx := strings.Index(userID, "session_")
+		if idx != -1 {
+			return userID[idx+8:]
+		}
+	}
 	messages := gjson.GetBytes(rawJSON, "messages")
 	if !messages.IsArray() {
 		return ""
@@ -60,6 +69,7 @@ func deriveSessionID(rawJSON []byte) string {
 // Returns:
 //   - []byte: The transformed request data in Gemini CLI API format
 func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
+	enableThoughtTranslate := true
 	rawJSON := bytes.Clone(inputRawJSON)
 
 	// Derive session ID for signature caching
@@ -122,26 +132,33 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					contentTypeResult := contentResult.Get("type")
 					if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "thinking" {
 						// Use GetThinkingText to handle wrapped thinking objects
-						thinkingText := util.GetThinkingText(contentResult)
-						signatureResult := contentResult.Get("signature")
-						clientSignature := ""
-						if signatureResult.Exists() && signatureResult.String() != "" {
-							clientSignature = signatureResult.String()
-						}
+						thinkingText := thinking.GetThinkingText(contentResult)
 
 						// Always try cached signature first (more reliable than client-provided)
 						// Client may send stale or invalid signatures from different sessions
 						signature := ""
 						if sessionID != "" && thinkingText != "" {
-							if cachedSig := cache.GetCachedSignature(sessionID, thinkingText); cachedSig != "" {
+							if cachedSig := cache.GetCachedSignature(modelName, sessionID, thinkingText); cachedSig != "" {
 								signature = cachedSig
 								// log.Debugf("Using cached signature for thinking block")
 							}
 						}
 
 						// Fallback to client signature only if cache miss and client signature is valid
-						if signature == "" && cache.HasValidSignature(clientSignature) {
-							signature = clientSignature
+						if signature == "" {
+							signatureResult := contentResult.Get("signature")
+							clientSignature := ""
+							if signatureResult.Exists() && signatureResult.String() != "" {
+								arrayClientSignatures := strings.SplitN(signatureResult.String(), "#", 2)
+								if len(arrayClientSignatures) == 2 {
+									if modelName == arrayClientSignatures[0] {
+										clientSignature = arrayClientSignatures[1]
+									}
+								}
+							}
+							if cache.HasValidSignature(clientSignature) {
+								signature = clientSignature
+							}
 							// log.Debugf("Using client-provided signature for thinking block")
 						}
 
@@ -158,6 +175,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						// Converting to text would break this requirement
 						if isUnsigned {
 							// log.Debugf("Dropping unsigned thinking block (no valid signature)")
+							enableThoughtTranslate = false
 							continue
 						}
 
@@ -385,12 +403,12 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 
 	// Map Anthropic thinking -> Gemini thinkingBudget/include_thoughts when type==enabled
-	if t := gjson.GetBytes(rawJSON, "thinking"); t.Exists() && t.IsObject() && util.ModelSupportsThinking(modelName) {
+	if t := gjson.GetBytes(rawJSON, "thinking"); enableThoughtTranslate && t.Exists() && t.IsObject() {
 		if t.Get("type").String() == "enabled" {
 			if b := t.Get("budget_tokens"); b.Exists() && b.Type == gjson.Number {
 				budget := int(b.Int())
 				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
-				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
+				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
 			}
 		}
 	}

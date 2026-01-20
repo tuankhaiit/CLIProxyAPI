@@ -3,7 +3,8 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"sort"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,10 +17,7 @@ type SignatureEntry struct {
 
 const (
 	// SignatureCacheTTL is how long signatures are valid
-	SignatureCacheTTL = 1 * time.Hour
-
-	// MaxEntriesPerSession limits memory usage per session
-	MaxEntriesPerSession = 100
+	SignatureCacheTTL = 3 * time.Hour
 
 	// SignatureTextHashLen is the length of the hash key (16 hex chars = 64-bit key space)
 	SignatureTextHashLen = 16
@@ -98,7 +96,7 @@ func purgeExpiredSessions() {
 
 // CacheSignature stores a thinking signature for a given session and text.
 // Used for Claude models that require signed thinking blocks in multi-turn conversations.
-func CacheSignature(sessionID, text, signature string) {
+func CacheSignature(modelName, sessionID, text, signature string) {
 	if sessionID == "" || text == "" || signature == "" {
 		return
 	}
@@ -106,48 +104,11 @@ func CacheSignature(sessionID, text, signature string) {
 		return
 	}
 
-	sc := getOrCreateSession(sessionID)
+	sc := getOrCreateSession(fmt.Sprintf("%s#%s", GetModelGroup(modelName), sessionID))
 	textHash := hashText(text)
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-
-	// Evict expired entries if at capacity
-	if len(sc.entries) >= MaxEntriesPerSession {
-		now := time.Now()
-		for key, entry := range sc.entries {
-			if now.Sub(entry.Timestamp) > SignatureCacheTTL {
-				delete(sc.entries, key)
-			}
-		}
-		// If still at capacity, remove oldest entries
-		if len(sc.entries) >= MaxEntriesPerSession {
-			// Find and remove oldest quarter
-			oldest := make([]struct {
-				key string
-				ts  time.Time
-			}, 0, len(sc.entries))
-			for key, entry := range sc.entries {
-				oldest = append(oldest, struct {
-					key string
-					ts  time.Time
-				}{key, entry.Timestamp})
-			}
-			// Sort by timestamp (oldest first) using sort.Slice
-			sort.Slice(oldest, func(i, j int) bool {
-				return oldest[i].ts.Before(oldest[j].ts)
-			})
-
-			toRemove := len(oldest) / 4
-			if toRemove < 1 {
-				toRemove = 1
-			}
-
-			for i := 0; i < toRemove; i++ {
-				delete(sc.entries, oldest[i].key)
-			}
-		}
-	}
 
 	sc.entries[textHash] = SignatureEntry{
 		Signature: signature,
@@ -157,12 +118,12 @@ func CacheSignature(sessionID, text, signature string) {
 
 // GetCachedSignature retrieves a cached signature for a given session and text.
 // Returns empty string if not found or expired.
-func GetCachedSignature(sessionID, text string) string {
+func GetCachedSignature(modelName, sessionID, text string) string {
 	if sessionID == "" || text == "" {
 		return ""
 	}
 
-	val, ok := signatureCache.Load(sessionID)
+	val, ok := signatureCache.Load(fmt.Sprintf("%s#%s", GetModelGroup(modelName), sessionID))
 	if !ok {
 		return ""
 	}
@@ -170,21 +131,24 @@ func GetCachedSignature(sessionID, text string) string {
 
 	textHash := hashText(text)
 
-	sc.mu.RLock()
-	entry, exists := sc.entries[textHash]
-	sc.mu.RUnlock()
+	now := time.Now()
 
+	sc.mu.Lock()
+	entry, exists := sc.entries[textHash]
 	if !exists {
+		sc.mu.Unlock()
 		return ""
 	}
-
-	// Check if expired
-	if time.Since(entry.Timestamp) > SignatureCacheTTL {
-		sc.mu.Lock()
+	if now.Sub(entry.Timestamp) > SignatureCacheTTL {
 		delete(sc.entries, textHash)
 		sc.mu.Unlock()
 		return ""
 	}
+
+	// Refresh TTL on access (sliding expiration).
+	entry.Timestamp = now
+	sc.entries[textHash] = entry
+	sc.mu.Unlock()
 
 	return entry.Signature
 }
@@ -204,4 +168,15 @@ func ClearSignatureCache(sessionID string) {
 // HasValidSignature checks if a signature is valid (non-empty and long enough)
 func HasValidSignature(signature string) bool {
 	return signature != "" && len(signature) >= MinValidSignatureLen
+}
+
+func GetModelGroup(modelName string) string {
+	if strings.Contains(modelName, "gpt") {
+		return "gpt"
+	} else if strings.Contains(modelName, "claude") {
+		return "claude"
+	} else if strings.Contains(modelName, "gemini") {
+		return "gemini"
+	}
+	return modelName
 }

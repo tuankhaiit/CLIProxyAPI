@@ -20,6 +20,11 @@ jobs:
         run: |
           git fetch --depth 1 https://github.com/router-for-me/models.git main
           git show FETCH_HEAD:models.json > internal/registry/models/models.json
+          git add internal/registry/models/models.json
+          git -c user.name="github-actions" -c user.email="github-actions@github.com" \
+            diff --cached --quiet || \
+            git -c user.name="github-actions" -c user.email="github-actions@github.com" \
+            commit -m "chore: refresh models catalog"
       - run: git fetch --force --tags
       - uses: actions/setup-go@v4
         with:

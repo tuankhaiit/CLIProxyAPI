@@ -2063,7 +2063,7 @@ func FetchAntigravityModelsWithQuota(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0)
+	httpClient := newAntigravityHTTPClient(ctx, cfg, auth, 0)
 
 	var lastErr error
 

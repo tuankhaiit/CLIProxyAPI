@@ -135,6 +135,10 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			return
 		}
 
+		// Sanitize request body: remove thinking blocks with invalid signatures
+		// to prevent upstream API 400 errors
+		bodyBytes = SanitizeAmpRequestBody(bodyBytes)
+
 		// Restore the body for the handler to read
 		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
@@ -300,6 +304,7 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			log.Debugf("amp model mapping: request %s -> %s", normalizedModel, resolvedModel)
 			logAmpRouting(RouteTypeModelMapping, modelName, resolvedModel, providerName, requestPath)
 			rewriter := NewResponseRewriter(c.Writer, modelName)
+			rewriter.suppressThinking = true
 			c.Writer = rewriter
 			// Filter Anthropic-Beta header only for local handling paths
 			filterAntropicBetaHeader(c)
@@ -310,10 +315,17 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 		} else if len(providers) > 0 {
 			// Log: Using local provider (free)
 			logAmpRouting(RouteTypeLocalProvider, modelName, resolvedModel, providerName, requestPath)
+			// Wrap with ResponseRewriter for local providers too, because upstream
+			// proxies (e.g. NewAPI) may return a different model name and lack
+			// Amp-required fields like thinking.signature.
+			rewriter := NewResponseRewriter(c.Writer, modelName)
+			rewriter.suppressThinking = providerName != "claude"
+			c.Writer = rewriter
 			// Filter Anthropic-Beta header only for local handling paths
 			filterAntropicBetaHeader(c)
 			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			handler(c)
+			rewriter.Flush()
 		} else {
 			// No provider, no mapping, no proxy: fall back to the wrapped handler so it can return an error response
 			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))

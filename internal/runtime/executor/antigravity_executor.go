@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -44,6 +45,7 @@ const (
 	antigravityCountTokensPath     = "/v1internal:countTokens"
 	antigravityStreamPath          = "/v1internal:streamGenerateContent"
 	antigravityGeneratePath        = "/v1internal:generateContent"
+	antigravityModelsPath          = "/v1internal:fetchAvailableModels"
 	antigravityClientID            = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	antigravityClientSecret        = "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"
 	defaultAntigravityAgent        = "antigravity/1.21.9 darwin/arm64" // fallback only; overridden at runtime by misc.AntigravityUserAgent()
@@ -1908,4 +1910,245 @@ func generateProjectID() string {
 	randSourceMutex.Unlock()
 	randomPart := strings.ToLower(uuid.NewString())[:5]
 	return adj + "-" + noun + "-" + randomPart
+}
+
+func modelName2Alias(modelName string) string {
+	switch modelName {
+	case "rev19-uic3-1p":
+		return "gemini-2.5-computer-use-preview-10-2025"
+	case "gemini-3-pro-image":
+		return "gemini-3-pro-image-preview"
+	case "gemini-3-pro-high":
+		return "gemini-3-pro-preview"
+	case "gemini-3-flash":
+		return "gemini-3-flash-preview"
+	case "claude-sonnet-4-5":
+		return "gemini-claude-sonnet-4-5"
+	case "claude-sonnet-4-5-thinking":
+		return "gemini-claude-sonnet-4-5-thinking"
+	case "claude-opus-4-5-thinking":
+		return "gemini-claude-opus-4-5-thinking"
+	case "chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-3-pro-low", "gemini-2.5-pro":
+		return ""
+	default:
+		return modelName
+	}
+}
+
+func alias2ModelName(modelName string) string {
+	switch modelName {
+	case "gemini-2.5-computer-use-preview-10-2025":
+		return "rev19-uic3-1p"
+	case "gemini-3-pro-image-preview":
+		return "gemini-3-pro-image"
+	case "gemini-3-pro-preview":
+		return "gemini-3-pro-high"
+	case "gemini-3-flash-preview":
+		return "gemini-3-flash"
+	case "gemini-claude-sonnet-4-5":
+		return "claude-sonnet-4-5"
+	case "gemini-claude-sonnet-4-5-thinking":
+		return "claude-sonnet-4-5-thinking"
+	case "gemini-claude-opus-4-5-thinking":
+		return "claude-opus-4-5-thinking"
+	default:
+		return modelName
+	}
+}
+
+// normalizeAntigravityThinking clamps or removes thinking config based on model support.
+// For Claude models, it additionally ensures thinking budget < max_tokens.
+func normalizeAntigravityThinking(model string, payload []byte, isClaude bool) []byte {
+	modelInfo := registry.GetGlobalRegistry().GetModelInfo(model, antigravityAuthType)
+	supportsThinking := modelInfo != nil && modelInfo.Thinking != nil
+
+	if !supportsThinking {
+		return thinking.StripThinkingConfig(payload, "antigravity")
+	}
+
+	budgetResult := gjson.GetBytes(payload, "request.generationConfig.thinkingConfig.thinkingBudget")
+	if !budgetResult.Exists() {
+		return payload
+	}
+	raw := int(budgetResult.Int())
+
+	normalized := raw
+	if modelInfo != nil && modelInfo.Thinking != nil {
+		min, max := modelInfo.Thinking.Min, modelInfo.Thinking.Max
+		if normalized == 0 && !modelInfo.Thinking.ZeroAllowed {
+			normalized = min
+		} else if normalized == -1 {
+			// Keep -1 (auto)
+		} else if min == 0 && max == 0 {
+			// No limits defined
+		} else if normalized < min {
+			if normalized == 0 && modelInfo.Thinking.ZeroAllowed {
+				normalized = 0
+			} else {
+				normalized = min
+			}
+		} else if normalized > max {
+			normalized = max
+		}
+	}
+
+	if isClaude {
+		effectiveMax, setDefaultMax := antigravityEffectiveMaxTokens(model, payload)
+		if effectiveMax > 0 && normalized >= effectiveMax {
+			normalized = effectiveMax - 1
+		}
+		minBudget := antigravityMinThinkingBudget(model)
+		if minBudget > 0 && normalized >= 0 && normalized < minBudget {
+			// Budget is below minimum, remove thinking config entirely
+			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.thinkingConfig")
+			return payload
+		}
+		if setDefaultMax {
+			if res, errSet := sjson.SetBytes(payload, "request.generationConfig.maxOutputTokens", effectiveMax); errSet == nil {
+				payload = res
+			}
+		}
+	}
+
+	updated, err := sjson.SetBytes(payload, "request.generationConfig.thinkingConfig.thinkingBudget", normalized)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+// antigravityEffectiveMaxTokens returns the max tokens to cap thinking:
+// prefer request-provided maxOutputTokens; otherwise fall back to model default.
+// The boolean indicates whether the value came from the model default (and thus should be written back).
+func antigravityEffectiveMaxTokens(model string, payload []byte) (max int, fromModel bool) {
+	if maxTok := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxTok.Exists() && maxTok.Int() > 0 {
+		return int(maxTok.Int()), false
+	}
+	if modelInfo := registry.GetGlobalRegistry().GetModelInfo(model, antigravityAuthType); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
+		return modelInfo.MaxCompletionTokens, true
+	}
+	return 0, false
+}
+
+// antigravityMinThinkingBudget returns the minimum thinking budget for a model.
+// Falls back to -1 if no model info is found.
+func antigravityMinThinkingBudget(model string) int {
+	if modelInfo := registry.GetGlobalRegistry().GetModelInfo(model, antigravityAuthType); modelInfo != nil && modelInfo.Thinking != nil {
+		return modelInfo.Thinking.Min
+	}
+	return -1
+}
+
+// AntigravityQuotaInfo represents the quota information for a model.
+type AntigravityQuotaInfo struct {
+	RemainingFraction float64 `json:"remaining_fraction"`
+	ResetTime         string  `json:"reset_time"`
+}
+
+// AntigravityModelWithQuota represents a model with its quota information.
+type AntigravityModelWithQuota struct {
+	ID    string               `json:"id"`
+	Quota AntigravityQuotaInfo `json:"quota"`
+}
+
+// FetchAntigravityModelsWithQuota retrieves available models and their quota information.
+func FetchAntigravityModelsWithQuota(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config, projectID string) ([]AntigravityModelWithQuota, error) {
+	exec := &AntigravityExecutor{cfg: cfg}
+	token, updatedAuth, errToken := exec.ensureAccessToken(ctx, auth)
+	if errToken != nil {
+		return nil, errToken
+	}
+	if updatedAuth != nil {
+		auth = updatedAuth
+	}
+
+	baseURLs := antigravityBaseURLFallbackOrder(auth)
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
+
+	var lastErr error
+
+	for idx, baseURL := range baseURLs {
+		modelsURL := baseURL + antigravityModelsPath
+
+		bodyJSON := "{}"
+		if projectID != "" {
+			bodyJSON = fmt.Sprintf(`{"project": "%s"}`, projectID)
+		}
+
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, modelsURL, bytes.NewReader([]byte(bodyJSON)))
+		if errReq != nil {
+			return nil, errReq
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+		if host := resolveHost(baseURL); host != "" {
+			httpReq.Host = host
+		}
+
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
+				return nil, errDo
+			}
+			lastErr = errDo
+			if idx+1 < len(baseURLs) {
+				log.Debugf("antigravity executor: models quota request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
+				continue
+			}
+			continue
+		}
+
+		bodyBytes, errRead := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("antigravity executor: close response body error: %v", errClose)
+		}
+		if errRead != nil {
+			lastErr = errRead
+			if idx+1 < len(baseURLs) {
+				log.Debugf("antigravity executor: models quota read error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
+				continue
+			}
+			continue
+		}
+		if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+			lastErr = fmt.Errorf("status %d: %s", httpResp.StatusCode, string(bodyBytes))
+			if httpResp.StatusCode == http.StatusTooManyRequests && idx+1 < len(baseURLs) {
+				log.Debugf("antigravity executor: models quota request rate limited on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
+				continue
+			}
+			continue
+		}
+
+		result := gjson.GetBytes(bodyBytes, "models")
+		if !result.Exists() {
+			return []AntigravityModelWithQuota{}, nil
+		}
+
+		models := make([]AntigravityModelWithQuota, 0, len(result.Map()))
+		for originalName, modelData := range result.Map() {
+			aliasName := modelName2Alias(originalName)
+			if aliasName != "" {
+				quotaInfo := AntigravityQuotaInfo{}
+
+				// Parse quota info if available
+				quotaNode := modelData.Get("quotaInfo")
+				if quotaNode.Exists() {
+					quotaInfo.RemainingFraction = quotaNode.Get("remainingFraction").Float()
+					quotaInfo.ResetTime = quotaNode.Get("resetTime").String()
+				}
+
+				models = append(models, AntigravityModelWithQuota{
+					ID:    aliasName,
+					Quota: quotaInfo,
+				})
+			}
+		}
+		return models, nil
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no base url available")
 }

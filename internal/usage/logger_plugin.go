@@ -235,53 +235,7 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result.TotalRequests = s.totalRequests
-	result.SuccessCount = s.successCount
-	result.FailureCount = s.failureCount
-	result.TotalTokens = s.totalTokens
-
-	result.APIs = make(map[string]APISnapshot, len(s.apis))
-	for apiName, stats := range s.apis {
-		apiSnapshot := APISnapshot{
-			TotalRequests: stats.TotalRequests,
-			TotalTokens:   stats.TotalTokens,
-			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
-		}
-		for modelName, modelStatsValue := range stats.Models {
-			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
-			copy(requestDetails, modelStatsValue.Details)
-			apiSnapshot.Models[modelName] = ModelSnapshot{
-				TotalRequests: modelStatsValue.TotalRequests,
-				TotalTokens:   modelStatsValue.TotalTokens,
-				Details:       requestDetails,
-			}
-		}
-		result.APIs[apiName] = apiSnapshot
-	}
-
-	result.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
-	for k, v := range s.requestsByDay {
-		result.RequestsByDay[k] = v
-	}
-
-	result.RequestsByHour = make(map[string]int64, len(s.requestsByHour))
-	for hour, v := range s.requestsByHour {
-		key := formatHour(hour)
-		result.RequestsByHour[key] = v
-	}
-
-	result.TokensByDay = make(map[string]int64, len(s.tokensByDay))
-	for k, v := range s.tokensByDay {
-		result.TokensByDay[k] = v
-	}
-
-	result.TokensByHour = make(map[string]int64, len(s.tokensByHour))
-	for hour, v := range s.tokensByHour {
-		key := formatHour(hour)
-		result.TokensByHour[key] = v
-	}
-
-	return result
+	return s.snapshotLocked()
 }
 
 type MergeResult struct {
@@ -350,6 +304,87 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				result.Added++
 			}
 		}
+	}
+
+	return result
+}
+
+// Clear resets all statistics to zero and returns a snapshot of the previous state.
+// This is useful for clearing metrics while preserving the ability to see what was cleared.
+func (s *RequestStatistics) Clear() StatisticsSnapshot {
+	if s == nil {
+		return StatisticsSnapshot{}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Capture snapshot before clearing
+	snapshot := s.snapshotLocked()
+
+	// Reset all counters
+	s.totalRequests = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalTokens = 0
+
+	// Clear all maps
+	s.apis = make(map[string]*apiStats)
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+
+	return snapshot
+}
+
+// snapshotLocked creates a snapshot without acquiring the lock (caller must hold lock).
+func (s *RequestStatistics) snapshotLocked() StatisticsSnapshot {
+	result := StatisticsSnapshot{}
+	result.TotalRequests = s.totalRequests
+	result.SuccessCount = s.successCount
+	result.FailureCount = s.failureCount
+	result.TotalTokens = s.totalTokens
+
+	result.APIs = make(map[string]APISnapshot, len(s.apis))
+	for apiName, stats := range s.apis {
+		apiSnapshot := APISnapshot{
+			TotalRequests: stats.TotalRequests,
+			TotalTokens:   stats.TotalTokens,
+			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
+			copy(requestDetails, modelStatsValue.Details)
+			apiSnapshot.Models[modelName] = ModelSnapshot{
+				TotalRequests: modelStatsValue.TotalRequests,
+				TotalTokens:   modelStatsValue.TotalTokens,
+				Details:       requestDetails,
+			}
+		}
+		result.APIs[apiName] = apiSnapshot
+	}
+
+	result.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
+	for k, v := range s.requestsByDay {
+		result.RequestsByDay[k] = v
+	}
+
+	result.RequestsByHour = make(map[string]int64, len(s.requestsByHour))
+	for hour, v := range s.requestsByHour {
+		key := formatHour(hour)
+		result.RequestsByHour[key] = v
+	}
+
+	result.TokensByDay = make(map[string]int64, len(s.tokensByDay))
+	for k, v := range s.tokensByDay {
+		result.TokensByDay[k] = v
+	}
+
+	result.TokensByHour = make(map[string]int64, len(s.tokensByHour))
+	for hour, v := range s.tokensByHour {
+		key := formatHour(hour)
+		result.TokensByHour[key] = v
 	}
 
 	return result

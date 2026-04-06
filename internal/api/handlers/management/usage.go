@@ -77,3 +77,22 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		"failed_requests": snapshot.FailureCount,
 	})
 }
+
+// ClearUsageStatistics resets all in-memory usage statistics to zero.
+// Returns a snapshot of the cleared data.
+func (h *Handler) ClearUsageStatistics(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
+		return
+	}
+
+	cleared := h.usageStats.Clear()
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "usage statistics cleared",
+		"cleared_total":   cleared.TotalRequests,
+		"cleared_success": cleared.SuccessCount,
+		"cleared_failed":  cleared.FailureCount,
+		"cleared_tokens":  cleared.TotalTokens,
+		"cleared_apis":    len(cleared.APIs),
+	})
+}

@@ -26,7 +26,7 @@ func TestFallbackHandler_ModelMapping_PreservesThinkingSuffixAndRewritesResponse
 		{From: "gpt-5.2", To: "test/gpt-5.2"},
 	})
 
-	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return nil }, mapper, nil)
+	fallback := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy { return nil }, mapper, nil, nil, nil)
 
 	handler := func(c *gin.Context) {
 		var req struct {

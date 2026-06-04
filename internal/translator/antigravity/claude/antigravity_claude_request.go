@@ -8,14 +8,232 @@ package claude
 import (
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func resolveThinkingSignature(modelName, thinkingText, rawSignature string) string {
+	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
+	if targetProvider == sigcompat.SignatureProviderGemini {
+		return resolveProviderCompatibleSignature(targetProvider, rawSignature, sigcompat.SignatureBlockKindGeminiModelPart)
+	}
+	if cache.SignatureCacheEnabled() {
+		return resolveCacheModeSignature(modelName, thinkingText, rawSignature)
+	}
+	if signature := resolveProviderCompatibleSignature(targetProvider, rawSignature, sigcompat.SignatureBlockKindUnknown); signature != "" {
+		return signature
+	}
+	return resolveBypassModeSignatureForProvider(targetProvider, rawSignature)
+}
+
+func resolveCacheModeSignature(modelName, thinkingText, rawSignature string) string {
+	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
+	if thinkingText != "" {
+		if cachedSig := cache.GetCachedSignature(modelName, thinkingText); cachedSig != "" {
+			if targetProvider == sigcompat.SignatureProviderClaude {
+				signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(cachedSig)
+				if !ok {
+					return ""
+				}
+				return signature
+			}
+			return cachedSig
+		}
+	}
+
+	if rawSignature == "" {
+		return ""
+	}
+
+	clientSignature := ""
+	arrayClientSignatures := strings.SplitN(rawSignature, "#", 2)
+	if len(arrayClientSignatures) == 2 {
+		if cache.GetModelGroup(modelName) == arrayClientSignatures[0] {
+			clientSignature = arrayClientSignatures[1]
+		}
+	}
+	if cache.HasValidSignature(modelName, clientSignature) {
+		if targetProvider == sigcompat.SignatureProviderClaude {
+			signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(clientSignature)
+			if !ok {
+				return ""
+			}
+			return signature
+		}
+		return clientSignature
+	}
+
+	return ""
+}
+
+func resolveBypassModeSignature(rawSignature string) string {
+	return resolveBypassModeSignatureForProvider(sigcompat.SignatureProviderClaude, rawSignature)
+}
+
+func resolveBypassModeSignatureForProvider(targetProvider sigcompat.SignatureProvider, rawSignature string) string {
+	if rawSignature == "" {
+		return ""
+	}
+	if targetProvider != sigcompat.SignatureProviderClaude && targetProvider != sigcompat.SignatureProviderUnknown {
+		return ""
+	}
+	if targetProvider == sigcompat.SignatureProviderClaude {
+		signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(rawSignature)
+		if !ok {
+			return ""
+		}
+		return signature
+	}
+	normalized, err := normalizeClaudeBypassSignature(rawSignature)
+	if err != nil {
+		return ""
+	}
+	return normalized
+}
+
+func hasResolvedThinkingSignature(modelName, signature string) bool {
+	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
+	if targetProvider == sigcompat.SignatureProviderClaude {
+		_, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(signature)
+		return ok
+	}
+	if _, ok := sigcompat.CompatibleSignatureForProvider(targetProvider, signature); ok {
+		return true
+	}
+	if cache.SignatureCacheEnabled() {
+		return cache.HasValidSignature(modelName, signature)
+	}
+	return signature != ""
+}
+
+func resolveProviderCompatibleSignature(targetProvider sigcompat.SignatureProvider, rawSignature string, blockKind sigcompat.SignatureBlockKind) string {
+	if rawSignature == "" {
+		return ""
+	}
+	if targetProvider == sigcompat.SignatureProviderClaude {
+		signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(rawSignature)
+		if !ok {
+			return ""
+		}
+		return signature
+	}
+	signature, ok := sigcompat.CompatibleSignatureForProviderBlock(targetProvider, rawSignature, blockKind)
+	if !ok {
+		return ""
+	}
+	return signature
+}
+
+func resolveToolUseThoughtSignature(modelName string, contentResult gjson.Result, allowSyntheticFallback bool) string {
+	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
+	if targetProvider == sigcompat.SignatureProviderGemini {
+		for _, path := range []string{
+			"signature",
+			"thought_signature",
+			"extra_content.google.thought_signature",
+		} {
+			if signatureResult := contentResult.Get(path); signatureResult.Exists() {
+				if signature := resolveProviderCompatibleSignature(targetProvider, signatureResult.String(), sigcompat.SignatureBlockKindGeminiFunctionCall); signature != "" {
+					return signature
+				}
+			}
+		}
+		if allowSyntheticFallback {
+			return sigcompat.GeminiSkipThoughtSignatureValidator
+		}
+		return ""
+	}
+
+	for _, path := range []string{
+		"signature",
+		"thought_signature",
+		"extra_content.google.thought_signature",
+	} {
+		if signatureResult := contentResult.Get(path); signatureResult.Exists() {
+			if signature := resolveProviderCompatibleSignature(targetProvider, signatureResult.String(), sigcompat.SignatureBlockKindUnknown); signature != "" {
+				return signature
+			}
+		}
+	}
+	if targetProvider == sigcompat.SignatureProviderClaude {
+		return ""
+	}
+	return sigcompat.GeminiSkipThoughtSignatureValidator
+}
+
+func firstToolUseSignatureField(contentResult gjson.Result) (string, string, bool) {
+	for _, path := range []string{
+		"signature",
+		"thought_signature",
+		"extra_content.google.thought_signature",
+	} {
+		signatureResult := contentResult.Get(path)
+		if signatureResult.Exists() {
+			return path, signatureResult.String(), true
+		}
+	}
+	return "", "", false
+}
+
+func logDroppedAntigravityThinkingSignature(modelName string, messageIndex, contentIndex int, thinkingText string, signatureResult gjson.Result) {
+	rawSignature := signatureResult.String()
+	fields := log.Fields{
+		"component":        "signature_sanitizer",
+		"translator":       "antigravity_claude",
+		"target_provider":  string(sigcompat.SignatureProviderFromModelName(modelName)),
+		"action":           "drop_thinking_block",
+		"reason":           "missing_or_incompatible_signature",
+		"model":            modelName,
+		"message_index":    messageIndex,
+		"content_index":    contentIndex,
+		"thinking_length":  len(thinkingText),
+		"has_signature":    signatureResult.Exists(),
+		"signature_length": len(strings.TrimSpace(rawSignature)),
+	}
+	if signatureResult.Exists() {
+		fields["detected_provider"] = string(sigcompat.DetectSignatureProviderForBlock(rawSignature, sigcompat.SignatureBlockKindClaudeThinking))
+	}
+	log.WithFields(fields).Debug("antigravity claude translator: dropped thinking block with incompatible signature")
+}
+
+func logDroppedAntigravityEmptyThinking(modelName string, messageIndex, contentIndex int) {
+	log.WithFields(log.Fields{
+		"component":       "signature_sanitizer",
+		"translator":      "antigravity_claude",
+		"target_provider": string(sigcompat.SignatureProviderFromModelName(modelName)),
+		"action":          "drop_thinking_block",
+		"reason":          "empty_thinking_text",
+		"model":           modelName,
+		"message_index":   messageIndex,
+		"content_index":   contentIndex,
+	}).Debug("antigravity claude translator: dropped empty thinking block")
+}
+
+func logDroppedAntigravityToolUseSignature(modelName string, messageIndex, contentIndex int, contentResult gjson.Result) {
+	path, rawSignature, ok := firstToolUseSignatureField(contentResult)
+	if !ok {
+		return
+	}
+	log.WithFields(log.Fields{
+		"component":         "signature_sanitizer",
+		"translator":        "antigravity_claude",
+		"target_provider":   string(sigcompat.SignatureProviderFromModelName(modelName)),
+		"action":            "drop_tool_use_signature",
+		"reason":            "missing_or_incompatible_signature",
+		"model":             modelName,
+		"message_index":     messageIndex,
+		"content_index":     contentIndex,
+		"signature_path":    path,
+		"signature_length":  len(strings.TrimSpace(rawSignature)),
+		"detected_provider": string(sigcompat.DetectSignatureProviderForBlock(rawSignature, sigcompat.SignatureBlockKindUnknown)),
+	}).Debug("antigravity claude translator: dropped tool_use signature field")
+}
 
 // ConvertClaudeRequestToAntigravity parses and transforms a Claude Code API request into Gemini CLI API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
@@ -51,6 +269,9 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			systemTypePromptResult := systemPromptResult.Get("type")
 			if systemTypePromptResult.Type == gjson.String && systemTypePromptResult.String() == "text" {
 				systemPrompt := systemPromptResult.Get("text").String()
+				if util.IsClaudeCodeAttributionSystemText(systemPrompt) {
+					continue
+				}
 				partJSON := []byte(`{}`)
 				if systemPrompt != "" {
 					partJSON, _ = sjson.SetBytes(partJSON, "text", systemPrompt)
@@ -59,7 +280,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				hasSystemInstruction = true
 			}
 		}
-	} else if systemResult.Type == gjson.String {
+	} else if systemResult.Type == gjson.String && !util.IsClaudeCodeAttributionSystemText(systemResult.String()) {
 		systemInstructionJSON = []byte(`{"role":"user","parts":[{"text":""}]}`)
 		systemInstructionJSON, _ = sjson.SetBytes(systemInstructionJSON, "parts.0.text", systemResult.String())
 		hasSystemInstruction = true
@@ -87,6 +308,8 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			role := originalRole
 			if role == "assistant" {
 				role = "model"
+			} else if role == "system" {
+				role = "user"
 			}
 			clientContentJSON := []byte(`{"role":"","parts":[]}`)
 			clientContentJSON, _ = sjson.SetBytes(clientContentJSON, "role", role)
@@ -94,62 +317,37 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			if contentsResult.IsArray() {
 				contentResults := contentsResult.Array()
 				numContents := len(contentResults)
-				var currentMessageThinkingSignature string
 				for j := 0; j < numContents; j++ {
 					contentResult := contentResults[j]
 					contentTypeResult := contentResult.Get("type")
 					if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "thinking" {
 						// Use GetThinkingText to handle wrapped thinking objects
 						thinkingText := thinking.GetThinkingText(contentResult)
+						signatureResult := contentResult.Get("signature")
+						signature := resolveThinkingSignature(modelName, thinkingText, signatureResult.String())
 
-						// Always try cached signature first (more reliable than client-provided)
-						// Client may send stale or invalid signatures from different sessions
-						signature := ""
-						if thinkingText != "" {
-							if cachedSig := cache.GetCachedSignature(modelName, thinkingText); cachedSig != "" {
-								signature = cachedSig
-								// log.Debugf("Using cached signature for thinking block")
-							}
-						}
-
-						// Fallback to client signature only if cache miss and client signature is valid
-						if signature == "" {
-							signatureResult := contentResult.Get("signature")
-							clientSignature := ""
-							if signatureResult.Exists() && signatureResult.String() != "" {
-								arrayClientSignatures := strings.SplitN(signatureResult.String(), "#", 2)
-								if len(arrayClientSignatures) == 2 {
-									if cache.GetModelGroup(modelName) == arrayClientSignatures[0] {
-										clientSignature = arrayClientSignatures[1]
-									}
-								}
-							}
-							if cache.HasValidSignature(modelName, clientSignature) {
-								signature = clientSignature
-							}
-							// log.Debugf("Using client-provided signature for thinking block")
-						}
-
-						// Store for subsequent tool_use in the same message
-						if cache.HasValidSignature(modelName, signature) {
-							currentMessageThinkingSignature = signature
-						}
-
-						// Skip trailing unsigned thinking blocks on last assistant message
-						isUnsigned := !cache.HasValidSignature(modelName, signature)
+						// Skip unsigned thinking blocks instead of converting them to text.
+						isUnsigned := !hasResolvedThinkingSignature(modelName, signature)
 
 						// If unsigned, skip entirely (don't convert to text)
 						// Claude requires assistant messages to start with thinking blocks when thinking is enabled
 						// Converting to text would break this requirement
 						if isUnsigned {
-							// log.Debugf("Dropping unsigned thinking block (no valid signature)")
+							logDroppedAntigravityThinkingSignature(modelName, i, j, thinkingText, signatureResult)
 							enableThoughtTranslate = false
 							continue
 						}
 
-						// Valid signature, send as thought block
-						// Always include "text" field — Google Antigravity API requires it
-						// even for redacted thinking where the text is empty.
+						// Drop empty-text thinking blocks (redacted thinking from Claude Max).
+						// Antigravity wraps empty text into a prompt-caching-scope object that
+						// omits the required inner "thinking" field, causing:
+						//   400 "messages.N.content.0.thinking.thinking: Field required"
+						if thinkingText == "" {
+							logDroppedAntigravityEmptyThinking(modelName, i, j)
+							continue
+						}
+
+						// Valid signature with content, send as thought block.
 						partJSON := []byte(`{}`)
 						partJSON, _ = sjson.SetBytes(partJSON, "thought", true)
 						partJSON, _ = sjson.SetBytes(partJSON, "text", thinkingText)
@@ -194,15 +392,11 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						if argsRaw != "" {
 							partJSON := []byte(`{}`)
 
-							// Use skip_thought_signature_validator for tool calls without valid thinking signature
-							// This is the approach used in opencode-google-antigravity-auth for Gemini
-							// and also works for Claude through Antigravity API
-							const skipSentinel = "skip_thought_signature_validator"
-							if cache.HasValidSignature(modelName, currentMessageThinkingSignature) {
-								partJSON, _ = sjson.SetBytes(partJSON, "thoughtSignature", currentMessageThinkingSignature)
+							signature := resolveToolUseThoughtSignature(modelName, contentResult, true)
+							if signature != "" {
+								partJSON, _ = sjson.SetBytes(partJSON, "thoughtSignature", signature)
 							} else {
-								// No valid signature - use skip sentinel to bypass validation
-								partJSON, _ = sjson.SetBytes(partJSON, "thoughtSignature", skipSentinel)
+								logDroppedAntigravityToolUseSignature(modelName, i, j, contentResult)
 							}
 
 							if functionID != "" {

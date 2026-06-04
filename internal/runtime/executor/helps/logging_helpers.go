@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -24,6 +24,7 @@ const (
 	apiRequestKey           = "API_REQUEST"
 	apiResponseKey          = "API_RESPONSE"
 	apiWebsocketTimelineKey = "API_WEBSOCKET_TIMELINE"
+	creditsUsedKey          = "__antigravity_credits_used__"
 )
 
 // UpstreamRequestLog captures the outbound upstream request details for logging.
@@ -101,6 +102,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 
 // RecordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
+	logging.SetResponseHeaders(ctx, headers)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -226,6 +228,7 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 
 // RecordAPIWebsocketHandshake stores the upstream websocket handshake response metadata.
 func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
+	logging.SetResponseHeaders(ctx, headers)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -249,6 +252,7 @@ func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status
 
 // RecordAPIWebsocketUpgradeRejection stores a rejected websocket upgrade as an HTTP attempt.
 func RecordAPIWebsocketUpgradeRejection(ctx context.Context, cfg *config.Config, info UpstreamRequestLog, status int, headers http.Header, body []byte) {
+	logging.SetResponseHeaders(ctx, headers)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -412,6 +416,13 @@ func appendAPIWebsocketTimeline(ginCtx *gin.Context, chunk []byte) {
 	if len(data) == 0 {
 		return
 	}
+	if source, ok := apiWebsocketTimelineSource(ginCtx); ok {
+		if errAppend := source.AppendPart(data); errAppend == nil {
+			return
+		} else {
+			log.WithError(errAppend).Warn("failed to append api websocket timeline log part")
+		}
+	}
 	if existing, exists := ginCtx.Get(apiWebsocketTimelineKey); exists {
 		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
 			combined := make([]byte, 0, len(existingBytes)+len(data)+2)
@@ -426,6 +437,18 @@ func appendAPIWebsocketTimeline(ginCtx *gin.Context, chunk []byte) {
 		}
 	}
 	ginCtx.Set(apiWebsocketTimelineKey, bytes.Clone(data))
+}
+
+func apiWebsocketTimelineSource(ginCtx *gin.Context) (*logging.FileBodySource, bool) {
+	if ginCtx == nil {
+		return nil, false
+	}
+	value, exists := ginCtx.Get(logging.APIWebsocketTimelineSourceContextKey)
+	if !exists {
+		return nil, false
+	}
+	source, ok := value.(*logging.FileBodySource)
+	return source, ok && source != nil
 }
 
 func markAPIResponseTimestamp(ginCtx *gin.Context) {
@@ -567,4 +590,25 @@ func LogWithRequestID(ctx context.Context) *log.Entry {
 		return log.NewEntry(log.StandardLogger())
 	}
 	return log.WithField("request_id", requestID)
+}
+
+// MarkCreditsUsed flags the request as having used AI credits for billing.
+func MarkCreditsUsed(ctx context.Context) {
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx != nil {
+		ginCtx.Set(creditsUsedKey, true)
+	}
+}
+
+// CreditsUsed returns true if the request used AI credits.
+func CreditsUsed(ctx context.Context) bool {
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx != nil {
+		if val, exists := ginCtx.Get(creditsUsedKey); exists {
+			if b, ok := val.(bool); ok {
+				return b
+			}
+		}
+	}
+	return false
 }

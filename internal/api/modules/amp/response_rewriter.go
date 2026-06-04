@@ -2,6 +2,7 @@ package amp
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -21,6 +22,7 @@ type ResponseRewriter struct {
 	originalModel    string
 	isStreaming      bool
 	suppressThinking bool
+	requestToolNames map[string]string
 }
 
 // NewResponseRewriter creates a new response rewriter for model name substitution.
@@ -30,6 +32,12 @@ func NewResponseRewriter(w gin.ResponseWriter, originalModel string) *ResponseRe
 		body:           &bytes.Buffer{},
 		originalModel:  originalModel,
 	}
+}
+
+func NewResponseRewriterForRequest(w gin.ResponseWriter, originalModel string, requestBody []byte) *ResponseRewriter {
+	rw := NewResponseRewriter(w, originalModel)
+	rw.requestToolNames = collectRequestToolNames(requestBody)
+	return rw
 }
 
 const maxBufferedResponseBytes = 2 * 1024 * 1024 // 2MB safety cap
@@ -122,6 +130,109 @@ func (rw *ResponseRewriter) Flush() {
 
 var modelFieldPaths = []string{"message.model", "model", "modelVersion", "response.model", "response.modelVersion"}
 
+// ampCanonicalToolNames maps tool names to the exact casing expected by the
+// Amp mode tool whitelist (case-sensitive match).
+var ampCanonicalToolNames = map[string]string{
+	"bash":  "Bash",
+	"read":  "Read",
+	"grep":  "Grep",
+	"glob":  "glob",
+	"task":  "Task",
+	"check": "Check",
+}
+
+func collectRequestToolNames(data []byte) map[string]string {
+	if len(data) == 0 {
+		return nil
+	}
+	parsed := gjson.ParseBytes(data)
+	names := map[string]string{}
+	conflicts := map[string]bool{}
+	record := func(name string) {
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if conflicts[key] {
+			return
+		}
+		if existing, exists := names[key]; exists {
+			if existing != name {
+				names[key] = ""
+				conflicts[key] = true
+			}
+			return
+		}
+		names[key] = name
+	}
+
+	for _, tool := range parsed.Get("tools").Array() {
+		record(tool.Get("name").String())
+	}
+	if parsed.Get("tool_choice.type").String() == "tool" {
+		record(parsed.Get("tool_choice.name").String())
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+func canonicalAmpToolName(name string, requestToolNames map[string]string) (string, bool) {
+	key := strings.ToLower(name)
+	if canonical, ok := requestToolNames[key]; ok {
+		if canonical == "" {
+			return "", false
+		}
+		return canonical, true
+	}
+	canonical, ok := ampCanonicalToolNames[key]
+	return canonical, ok
+}
+
+// normalizeAmpToolNames fixes tool_use block names to match Amp's canonical casing.
+// Some upstream models return lowercase tool names (e.g. "bash" instead of "Bash")
+// which causes Amp's case-sensitive mode whitelist to reject them.
+func normalizeAmpToolNames(data []byte) []byte {
+	return normalizeAmpToolNamesForRequest(data, nil)
+}
+
+func normalizeAmpToolNamesForRequest(data []byte, requestToolNames map[string]string) []byte {
+	// Non-streaming: content[].name in tool_use blocks
+	for index, block := range gjson.GetBytes(data, "content").Array() {
+		if block.Get("type").String() != "tool_use" {
+			continue
+		}
+		name := block.Get("name").String()
+		if canonical, ok := canonicalAmpToolName(name, requestToolNames); ok && name != canonical {
+			path := fmt.Sprintf("content.%d.name", index)
+			var err error
+			data, err = sjson.SetBytes(data, path, canonical)
+			if err != nil {
+				log.Warnf("Amp ResponseRewriter: failed to normalize tool name %q to %q: %v", name, canonical, err)
+			}
+		}
+	}
+
+	// Streaming: content_block.name in content_block_start events
+	if gjson.GetBytes(data, "content_block.type").String() == "tool_use" {
+		name := gjson.GetBytes(data, "content_block.name").String()
+		if canonical, ok := canonicalAmpToolName(name, requestToolNames); ok && name != canonical {
+			var err error
+			data, err = sjson.SetBytes(data, "content_block.name", canonical)
+			if err != nil {
+				log.Warnf("Amp ResponseRewriter: failed to normalize streaming tool name %q to %q: %v", name, canonical, err)
+			}
+		}
+	}
+
+	return data
+}
+
+func (rw *ResponseRewriter) normalizeToolNames(data []byte) []byte {
+	return normalizeAmpToolNamesForRequest(data, rw.requestToolNames)
+}
+
 // ensureAmpSignature injects empty signature fields into tool_use/thinking blocks
 // in API responses so that the Amp TUI does not crash on P.signature.length.
 func ensureAmpSignature(data []byte) []byte {
@@ -178,6 +289,7 @@ func (rw *ResponseRewriter) suppressAmpThinking(data []byte) []byte {
 
 func (rw *ResponseRewriter) rewriteModelInResponse(data []byte) []byte {
 	data = ensureAmpSignature(data)
+	data = rw.normalizeToolNames(data)
 	data = rw.suppressAmpThinking(data)
 	if len(data) == 0 {
 		return data
@@ -277,6 +389,9 @@ func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 	// Inject empty signature where needed
 	data = ensureAmpSignature(data)
 
+	// Normalize tool names to canonical casing
+	data = rw.normalizeToolNames(data)
+
 	// Rewrite model name
 	if rw.originalModel != "" {
 		for _, path := range modelFieldPaths {
@@ -290,8 +405,10 @@ func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
 }
 
 // SanitizeAmpRequestBody removes thinking blocks with empty/missing/invalid signatures
-// from the messages array in a request body before forwarding to the upstream API.
-// This prevents 400 errors from the API which requires valid signatures on thinking blocks.
+// and strips the proxy-injected "signature" field from tool_use blocks in the messages
+// array before forwarding to the upstream API.
+// This prevents 400 errors from the API which requires valid signatures on thinking
+// blocks and does not accept a signature field on tool_use blocks.
 func SanitizeAmpRequestBody(body []byte) []byte {
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
@@ -309,21 +426,30 @@ func SanitizeAmpRequestBody(body []byte) []byte {
 		}
 
 		var keepBlocks []interface{}
-		removedCount := 0
+		contentModified := false
 
 		for _, block := range content.Array() {
 			blockType := block.Get("type").String()
 			if blockType == "thinking" {
 				sig := block.Get("signature")
 				if !sig.Exists() || sig.Type != gjson.String || strings.TrimSpace(sig.String()) == "" {
-					removedCount++
+					contentModified = true
 					continue
 				}
 			}
-			keepBlocks = append(keepBlocks, block.Value())
+
+			// Use raw JSON to prevent float64 rounding of large integers in tool_use inputs
+			blockRaw := []byte(block.Raw)
+			if blockType == "tool_use" && block.Get("signature").Exists() {
+				blockRaw, _ = sjson.DeleteBytes(blockRaw, "signature")
+				contentModified = true
+			}
+
+			// sjson.SetBytes supports raw JSON strings if wrapped in gjson.Raw
+			keepBlocks = append(keepBlocks, json.RawMessage(blockRaw))
 		}
 
-		if removedCount > 0 {
+		if contentModified {
 			contentPath := fmt.Sprintf("messages.%d.content", msgIdx)
 			var err error
 			if len(keepBlocks) == 0 {
@@ -332,11 +458,10 @@ func SanitizeAmpRequestBody(body []byte) []byte {
 				body, err = sjson.SetBytes(body, contentPath, keepBlocks)
 			}
 			if err != nil {
-				log.Warnf("Amp RequestSanitizer: failed to remove thinking blocks from message %d: %v", msgIdx, err)
+				log.Warnf("Amp RequestSanitizer: failed to sanitize message %d: %v", msgIdx, err)
 				continue
 			}
 			modified = true
-			log.Debugf("Amp RequestSanitizer: removed %d thinking blocks with invalid signatures from message %d", removedCount, msgIdx)
 		}
 	}
 
